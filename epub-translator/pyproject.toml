@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epub-translator"
+version = "0.1.0"
+description = "Translate French EPUBs to English with structure preservation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Josh", email = "josh@example.com"}]
+keywords = ["epub", "translation", "french", "english", "ebook"]
+
+dependencies = [
+    "PySide6>=6.6.0",
+    "ebooklib>=0.18.0",
+    "lxml>=4.9.0",
+    "BeautifulSoup4>=4.12.0",
+    "argostranslate>=1.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "black>=23.0.0",
+]
+
+[project.scripts]
+epub-translator = "epub_translator.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

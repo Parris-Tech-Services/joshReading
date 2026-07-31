@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+*.argosmodel
+.pytest_cache/
+*.epub

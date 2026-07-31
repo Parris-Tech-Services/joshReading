@@ -1,0 +1,413 @@
+import { google } from 'googleapis';
+import type { BookEntry, LibrarySource, BookFormat } from '@/types/books';
+
+/**
+ * Google Drive folder IDs for the fixed library sources.
+ * JoshReadingOnline reads these from env so it can point at a personal Gmail Drive
+ * without reusing the Cornerstone Workspace folder IDs from JoshBooks.
+ */
+export const FIXED_FOLDERS: Record<Exclude<LibrarySource, 'Local Books'>, string> = {
+  'IT PD Ebooks': process.env.GOOGLE_DRIVE_FOLDER_IT_PD_EBOOKS ?? '',
+  'Book Club': process.env.GOOGLE_DRIVE_FOLDER_BOOK_CLUB ?? '',
+  Unsorted: process.env.GOOGLE_DRIVE_FOLDER_UNSORTED ?? '',
+  'Avance KBs': process.env.GOOGLE_DRIVE_FOLDER_AVANCE_KBS ?? '',
+  'ITIL PDFs': process.env.GOOGLE_DRIVE_FOLDER_ITIL_PDFS ?? '',
+  ITIL: process.env.GOOGLE_DRIVE_FOLDER_ITIL ?? '',
+  'ITIL PRINCE COBIT': process.env.GOOGLE_DRIVE_FOLDER_ITIL_PRINCE_COBIT ?? '',
+  'IEC 27001': process.env.GOOGLE_DRIVE_FOLDER_IEC_27001 ?? '',
+};
+
+/**
+ * Create an OAuth2 client with the given access token
+ */
+export function getOAuthClient(accessToken: string) {
+  const auth = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+  auth.setCredentials({ access_token: accessToken });
+  return auth;
+}
+
+/**
+ * Extract book format from MIME type
+ */
+function getMimeTypeFormat(mimeType: string): BookFormat | null {
+  if (mimeType === 'application/pdf') return 'pdf';
+  if (mimeType === 'application/epub+zip') return 'epub';
+  if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return 'docx';
+  if (mimeType === 'text/plain') return 'txt';
+  return null;
+}
+
+/**
+ * Parse app properties safely, defaulting to sensible values
+ */
+function parseAppProperties(appProperties?: Record<string, string>) {
+  return {
+    readingProgress: appProperties?.progressPercentage 
+      ? parseInt(appProperties.progressPercentage, 10) 
+      : 0,
+    lastLocation: appProperties?.lastLocation ?? '',
+    lastOpened: appProperties?.lastOpened,
+  };
+}
+
+/**
+ * List all PDF and EPUB files in a specific Drive folder
+ * Handles pagination automatically
+ */
+export async function listFilesInFolder(
+  accessToken: string,
+  folderId: string,
+  source: LibrarySource
+): Promise<BookEntry[]> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  const books: BookEntry[] = [];
+  let pageToken: string | null | undefined;
+
+  do {
+    const response = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false and (mimeType = 'application/pdf' or mimeType = 'application/epub+zip' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or mimeType = 'text/plain')`,
+      fields:
+        'nextPageToken, files(id, name, mimeType, size, modifiedTime, thumbnailLink, appProperties)',
+      pageSize: 100,
+      pageToken: pageToken ?? undefined,
+    });
+
+    const files = response.data.files || [];
+    for (const file of files) {
+      const format = getMimeTypeFormat(file.mimeType!);
+      if (!format) continue; // Skip unsupported formats
+
+      const appProps = parseAppProperties(
+        file.appProperties as Record<string, string> | undefined
+      );
+
+      books.push({
+        id: file.id!,
+        name: file.name!,
+        mimeType: file.mimeType!,
+        size: file.size ? parseInt(file.size as string, 10) : 0,
+        modifiedTime: file.modifiedTime!,
+        thumbnailLink: file.thumbnailLink ?? undefined,
+        source,
+        format,
+        readingProgress: appProps.readingProgress,
+        lastLocation: appProps.lastLocation,
+        lastOpened: appProps.lastOpened,
+      });
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+
+  return books;
+}
+
+/**
+ * Find the "Local Books" folder ID owned by the current user
+ * Returns null if not found
+ */
+export async function findLocalBooksFolderId(accessToken: string): Promise<string | null> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  const response = await drive.files.list({
+    q: "name = 'Local Books' and mimeType = 'application/vnd.google-apps.folder' and 'me' in owners and trashed = false",
+    fields: 'files(id)',
+    pageSize: 1,
+  });
+
+  const files = response.data.files || [];
+  return files.length > 0 ? files[0].id! : null;
+}
+
+/**
+ * Get all library files from all sources (three fixed folders + Local Books if found)
+ * Deduplicates by file ID
+ */
+export async function getAllLibraryFiles(accessToken: string): Promise<BookEntry[]> {
+  const allBooks: BookEntry[] = [];
+  const seenIds = new Set<string>();
+
+  // Fetch from the configured fixed folders
+  for (const [source, folderId] of Object.entries(FIXED_FOLDERS)) {
+    if (!folderId) continue;
+
+    try {
+      const books = await listFilesInFolder(
+        accessToken,
+        folderId,
+        source as Exclude<LibrarySource, 'Local Books'>
+      );
+      for (const book of books) {
+        if (!seenIds.has(book.id)) {
+          allBooks.push(book);
+          seenIds.add(book.id);
+        }
+      }
+    } catch (error) {
+      console.error(`Failed to fetch from ${source}:`, error);
+    }
+  }
+
+  // Try to fetch from Local Books if it exists
+  try {
+    const localBooksId = await findLocalBooksFolderId(accessToken);
+    if (localBooksId) {
+      const books = await listFilesInFolder(accessToken, localBooksId, 'Local Books');
+      for (const book of books) {
+        if (!seenIds.has(book.id)) {
+          allBooks.push(book);
+          seenIds.add(book.id);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Failed to fetch from Local Books:', error);
+  }
+
+  return allBooks;
+}
+
+/**
+ * Update a book's reading progress in Google Drive appProperties
+ * Note: appProperties values must be strings
+ */
+export async function updateBookProgress(
+  accessToken: string,
+  fileId: string,
+  progress: number,
+  location: string
+): Promise<void> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  await drive.files.update({
+    fileId,
+    requestBody: {
+      appProperties: {
+        progressPercentage: String(Math.round(progress)),
+        lastLocation: location,
+        lastOpened: new Date().toISOString(),
+      },
+    },
+  });
+}
+
+/**
+ * Get metadata for a specific file by its ID
+ * Used for importing files selected from the Google Picker
+ */
+export async function getFileMetadata(
+  accessToken: string,
+  fileId: string
+): Promise<{ id: string; name: string; mimeType: string; size: number; modifiedTime: string } | null> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  try {
+    const response = await drive.files.get({
+      fileId,
+      fields: 'id, name, mimeType, size, modifiedTime',
+    });
+
+    if (!response.data) {
+      return null;
+    }
+
+    return {
+      id: response.data.id!,
+      name: response.data.name!,
+      mimeType: response.data.mimeType!,
+      size: response.data.size ? parseInt(response.data.size as string, 10) : 0,
+      modifiedTime: response.data.modifiedTime!,
+    };
+  } catch (error) {
+    console.error(`Failed to get metadata for file ${fileId}:`, error);
+    return null;
+  }
+}
+
+interface DriveFolderItem {
+  id: string;
+  name: string;
+  mimeType: string;
+}
+
+export async function listFolderItems(
+  accessToken: string,
+  folderId: string
+): Promise<DriveFolderItem[]> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  const items: DriveFolderItem[] = [];
+  let pageToken: string | null | undefined;
+
+  do {
+    const response = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'nextPageToken, files(id, name, mimeType)',
+      pageSize: 100,
+      pageToken: pageToken ?? undefined,
+    });
+
+    const files = response.data.files || [];
+    for (const file of files) {
+      if (file.id && file.name && file.mimeType) {
+        items.push({ id: file.id, name: file.name, mimeType: file.mimeType });
+      }
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+
+  return items;
+}
+
+export function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[\p{P}$+<=>^`|~]/gu, ' ')
+    .replace(/\b(the|a|an|book|ebook|audiobook|audio|series|volume|vol|part|chapter|disc|cd)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function hasCommonNGram(a: string, b: string, n = 3): boolean {
+  const aWords = a.split(' ').filter(Boolean);
+  const bText = b.split(' ').filter(Boolean).join(' ');
+
+  for (let i = 0; i + n <= aWords.length; i += 1) {
+    const nGram = aWords.slice(i, i + n).join(' ');
+    if (bText.includes(nGram)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function fuzzyMatchNames(a: string, b: string): boolean {
+  const normalizedA = normalizeText(a);
+  const normalizedB = normalizeText(b);
+
+  if (!normalizedA || !normalizedB) {
+    return false;
+  }
+
+  if (normalizedA.includes(normalizedB) || normalizedB.includes(normalizedA)) {
+    return true;
+  }
+
+  return hasCommonNGram(normalizedA, normalizedB, 3) || hasCommonNGram(normalizedB, normalizedA, 3);
+}
+
+/**
+ * Add an imported file to the Unsorted folder by making Unsorted a parent
+ * This ensures the file appears in the library listing without moving it
+ */
+export async function addFileToUnsorted(
+  accessToken: string,
+  fileId: string
+): Promise<boolean> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  try {
+    // Get current parents
+    const fileInfo = await drive.files.get({
+      fileId,
+      fields: 'parents',
+    });
+
+    const currentParents = (fileInfo.data.parents || []).join(',');
+    const unsortedFolderId = FIXED_FOLDERS['Unsorted'];
+    if (!unsortedFolderId) {
+      console.error('Cannot import file: GOOGLE_DRIVE_FOLDER_UNSORTED is not configured');
+      return false;
+    }
+
+    // Check if already in Unsorted
+    if (currentParents.includes(unsortedFolderId)) {
+      return true;
+    }
+
+    // Add Unsorted as a parent (file can have multiple parents in Drive)
+    await drive.files.update({
+      fileId,
+      addParents: unsortedFolderId,
+      fields: 'id, parents',
+    });
+
+    return true;
+  } catch (error) {
+    console.error(`Failed to add file ${fileId} to Unsorted folder:`, error);
+    return false;
+  }
+}
+
+/**
+ * List files in a folder (recursively if folder is selected)
+ * Handles both individual files and folders from the Picker
+ */
+export async function listFilesInFolderRecursive(
+  accessToken: string,
+  folderId: string,
+  source: LibrarySource = 'Unsorted'
+): Promise<BookEntry[]> {
+  const auth = getOAuthClient(accessToken);
+  const drive = google.drive({ version: 'v3', auth });
+
+  const books: BookEntry[] = [];
+  let pageToken: string | null | undefined;
+
+  do {
+    const response = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false and (mimeType = 'application/pdf' or mimeType = 'application/epub+zip' or mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or mimeType = 'text/plain' or mimeType = 'application/vnd.google-apps.folder')`,
+      fields:
+        'nextPageToken, files(id, name, mimeType, size, modifiedTime, thumbnailLink, appProperties)',
+      pageSize: 100,
+      pageToken: pageToken ?? undefined,
+    });
+
+    const files = response.data.files || [];
+    for (const file of files) {
+      // If it's a folder, recursively list files within it
+      if (file.mimeType === 'application/vnd.google-apps.folder') {
+        const nestedBooks = await listFilesInFolderRecursive(accessToken, file.id!, source);
+        books.push(...nestedBooks);
+        continue;
+      }
+
+      const format = getMimeTypeFormat(file.mimeType!);
+      if (!format) continue; // Skip unsupported formats
+
+      const appProps = parseAppProperties(
+        file.appProperties as Record<string, string> | undefined
+      );
+
+      books.push({
+        id: file.id!,
+        name: file.name!,
+        mimeType: file.mimeType!,
+        size: file.size ? parseInt(file.size as string, 10) : 0,
+        modifiedTime: file.modifiedTime!,
+        thumbnailLink: file.thumbnailLink ?? undefined,
+        source,
+        format,
+        readingProgress: appProps.readingProgress,
+        lastLocation: appProps.lastLocation,
+        lastOpened: appProps.lastOpened,
+      });
+    }
+
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+
+  return books;
+}

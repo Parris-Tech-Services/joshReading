@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EPUB Translator
+Comment=Translate French EPUBs to English
+Exec=bash -c 'cd /home/josh/Projects/JoshBooks/epub-translator && source venv/bin/activate && python -m epub_translator.main'
+Icon=document-properties
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=true
